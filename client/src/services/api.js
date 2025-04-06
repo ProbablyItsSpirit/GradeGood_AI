@@ -309,4 +309,108 @@ export const uploadAudio = async (file, studentId) => {
   }
 };
 
+export const processChatMessage = async (message, userId) => {
+  try {
+    // Set a reasonable timeout
+    const response = await api.post("/chat", {  // Changed from "/api/chat" to "/chat"
+      message: message,
+      student_id: userId,
+    }, {
+      timeout: 15000, // 15 seconds timeout
+    });
+    return response.data;
+  } catch (error) {
+    console.error("Error sending chat message:", error);
+    // Improve error handling with more specific errors
+    if (error.code === 'ECONNABORTED') {
+      return { error: "Request timed out. The server took too long to respond." };
+    }
+    if (!navigator.onLine) {
+      return { error: "You are offline. Please check your internet connection." };
+    }
+    return { error: error.message || "Unknown error occurred" };
+  }
+};
+
+export const uploadFileToBackend = async (file, fileType) => {
+  try {
+    const formData = new FormData();
+    formData.append("fileType", fileType);
+    formData.append("file", file);
+    
+    // Try the direct endpoint first, fall back to the prefixed one if needed
+    try {
+      const response = await axios.post(`${API_BASE_URL}/api/files`, formData, {
+        headers: { "Content-Type": "multipart/form-data" },
+      });
+      return response.data;
+    } catch (e) {
+      if (e.response && e.response.status === 404) {
+        // Fall back to the /files endpoint if /api/files returns 404
+        console.log("Falling back to /files endpoint");
+        const response = await axios.post(`${API_BASE_URL}/files`, formData, {
+          headers: { "Content-Type": "multipart/form-data" },
+        });
+        return response.data;
+      }
+      throw e; // Re-throw if it's a different error
+    }
+  } catch (error) {
+    console.error("File upload error:", error);
+    return { error: error.message };
+  }
+};
+
+export const gradeAnswerPaper = async (file, assignmentId, userId) => {
+  try {
+    const formData = new FormData();
+    formData.append("file", file);
+    formData.append("assignment_id", assignmentId || "default_assignment");
+    formData.append("student_id", userId);
+
+    // Try the direct gradeAnswer endpoint first
+    try {
+      const response = await axios.post(`${API_BASE_URL}/gradeAnswer`, formData, {
+        headers: {
+          "Content-Type": "multipart/form-data",
+        },
+      });
+      
+      // Ensure feedback is properly formatted
+      if (response.data && response.data.feedback) {
+        // Check if the feedback is already in markdown format
+        const hasMarkdownFormatting = 
+          response.data.feedback.includes('#') || 
+          response.data.feedback.includes('*') ||
+          response.data.feedback.includes('```');
+        
+        if (!hasMarkdownFormatting) {
+          // Simple formatting for plaintext responses
+          response.data.feedback = response.data.feedback
+            .replace(/(\d+)\.\s+([A-Z][^:]+):/g, '## $1. $2:')
+            .replace(/\*\*([^*]+)\*\*/g, '**$1**')
+            .replace(/([A-Z][^:]+):/g, '**$1:**');
+        }
+      }
+      
+      return response.data;
+    } catch (e) {
+      if (e.response && e.response.status === 404) {
+        // Fall back to the /upload/answer_sheet endpoint
+        console.log("Falling back to /upload/answer_sheet endpoint");
+        const response = await axios.post(`${API_BASE_URL}/upload/answer_sheet`, formData, {
+          headers: {
+            "Content-Type": "multipart/form-data",
+          },
+        });
+        return response.data;
+      }
+      throw e; // Re-throw if it's a different error
+    }
+  } catch (error) {
+    console.error("Error grading answer paper:", error);
+    return { error: error.message, feedback: "Grading failed. Please try again." };
+  }
+};
+
 export default api;

@@ -1,6 +1,7 @@
 "use client"
 
 import { useEffect, useState, useRef, useMemo, useCallback } from "react"
+import axios from "axios"; // Corrected import statement for axios
 import {
   Box,
   Typography,
@@ -61,10 +62,17 @@ import {
 } from "@mui/material"
 import { styled, keyframes } from "@mui/material/styles"
 import { getAuth, signOut } from "firebase/auth"
-import { doc, getDoc, collection, addDoc } from "firebase/firestore"
+import { doc, getDoc, collection, addDoc, serverTimestamp } from "firebase/firestore"
 import { db, testFirestoreConnection } from "../firebase"
 import { useNavigate } from "react-router-dom"
 import FirebaseRulesGuide from "../components/FirebaseRulesGuide"
+import { ref, uploadBytes, getDownloadURL } from "firebase/storage"
+import { storage } from "../firebase"
+import {
+  LightMode as LightModeIcon,
+  DarkMode as DarkModeIcon,
+} from "@mui/icons-material"
+import { ThemeProvider, createTheme } from "@mui/material/styles"
 import {
   Send as SendIcon,
   History as HistoryIcon,
@@ -119,6 +127,40 @@ import {
   ViewModule as ViewModuleIcon,
 } from "@mui/icons-material"
 
+
+import * as pdfjsLib from "pdfjs-dist";
+
+// Set up the worker using a string URL
+pdfjsLib.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjsLib.version}/build/pdf.worker.min.js`;
+
+const extractTextFromPDF = async (file) => {
+  try {
+    console.log("Extracting text from PDF:", file.name);
+    const fileData = await file.arrayBuffer();
+    
+    // Create a document loading task
+    const loadingTask = pdfjsLib.getDocument({data: fileData});
+    const pdf = await loadingTask.promise;
+    console.log(`PDF loaded successfully with ${pdf.numPages} pages`);
+    
+    let fullText = '';
+    
+    // Process each page
+    for (let i = 1; i <= pdf.numPages; i++) {
+      const page = await pdf.getPage(i);
+      const textContent = await page.getTextContent();
+      const pageText = textContent.items.map(item => item.str).join(' ');
+      fullText += `Page ${i}:\n${pageText}\n\n`;
+    }
+    
+    console.log("PDF text extraction completed successfully");
+    return fullText;
+  } catch (error) {
+    console.error("Error extracting PDF text:", error);
+    // Return a fallback message that will be included in the chat
+    return `[Error extracting text from ${file.name}: ${error.message}]`;
+  }
+};
 // Animation keyframes
 const fadeIn = keyframes`
   from {
@@ -191,7 +233,6 @@ const float = keyframes`
 
 // Styled components
 const drawerWidth = 240
-
 const Main = styled("main")(({ theme }) => ({
   flexGrow: 1,
   padding: theme.spacing(3),
@@ -204,7 +245,10 @@ const Main = styled("main")(({ theme }) => ({
   animation: `${fadeIn} 0.5s ease-in-out`,
 }))
 
-const MessageBubble = styled(Box)(({ theme, isUser }) => ({
+// Update your MessageBubble definition like this:
+const MessageBubble = styled(Box, {
+  shouldForwardProp: (prop) => prop !== 'isUser'
+})(({ theme, isUser }) => ({
   maxWidth: "80%",
   padding: theme.spacing(1.5),
   borderRadius: theme.spacing(2),
@@ -257,6 +301,7 @@ const RippleEffect = styled(Box)(({ theme }) => ({
   left: "50%",
   width: "100%",
   height: "100%",
+  transform: "translate(-50%, -50%)",
   borderRadius: "50%",
   backgroundColor: theme.palette.error.main,
   opacity: 0.3,
@@ -299,12 +344,25 @@ const ProgressIndicator = styled(LinearProgress)(({ theme, value }) => ({
       value >= 80
         ? `linear-gradient(90deg, ${theme.palette.success.main}, ${theme.palette.success.light})`
         : value >= 70
-          ? `linear-gradient(90deg, ${theme.palette.warning.main}, ${theme.palette.warning.light})`
-          : `linear-gradient(90deg, ${theme.palette.error.main}, ${theme.palette.error.light})`,
+        ? `linear-gradient(90deg, ${theme.palette.warning.main}, ${theme.palette.warning.light})`
+        : `linear-gradient(90deg, ${theme.palette.error.main}, ${theme.palette.error.light})`,
   },
 }))
 
-// Typing animation cursor
+const createMessageWithFiles = (content, files) => {
+  return {
+    content,
+    role: "user",
+    timestamp: new Date().toISOString(),
+    // Store only file metadata, not File objects
+    fileReferences: files.map(file => ({
+      name: file.name,
+      type: file.type,
+      size: file.size,
+      // You could add a download URL here if you upload to Storage first
+    }))
+  };
+};
 const TypingCursor = styled("span")(({ theme }) => ({
   display: "inline-block",
   width: "2px",
@@ -315,7 +373,6 @@ const TypingCursor = styled("span")(({ theme }) => ({
   animation: `${blink} 1s infinite`,
 }))
 
-// Resource card with hover effect
 const ResourceCard = styled(Card)(({ theme }) => ({
   height: "100%",
   display: "flex",
@@ -330,7 +387,6 @@ const ResourceCard = styled(Card)(({ theme }) => ({
   },
 }))
 
-// Floating icon container
 const IconContainer = styled(Box)(({ theme }) => ({
   display: "flex",
   alignItems: "center",
@@ -343,12 +399,101 @@ const IconContainer = styled(Box)(({ theme }) => ({
   height: 60,
 }))
 
+// Backend API URL (replace with your actual backend URL)
+const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000'
 // Add this function before the component
 function debounce(func, wait) {
   let timeout
   return function (...args) {
     clearTimeout(timeout)
     timeout = setTimeout(() => func.apply(this, args), wait)
+  }
+}
+
+// File upload utility for Firebase Storage
+const uploadFileToStorage = async (file, userId, type) => {
+  try {
+    const timestamp = new Date().getTime()
+    const fileExtension = file.name.split('.').pop()
+    const fileName = `${type}_${timestamp}.${fileExtension}`
+    const storageRef = ref(storage, `uploads/${userId}/${fileName}`)
+    const snapshot = await uploadBytes(storageRef, file)
+    const downloadURL = await getDownloadURL(snapshot.ref)
+    return {
+      name: file.name,
+      url: downloadURL,
+      type: type,
+      uploadTime: timestamp
+    }
+  } catch (error) {
+    console.error("Error uploading file to storage:", error)
+    throw error
+  }
+}
+
+// Send files to backend for grading
+const sendFilesForGrading = async (files, userId) => {
+  try {
+    const fileData = {}
+
+    // Upload each file to Firebase Storage and get download URLs
+    for (const file of files) {
+      // Determine file type (question, answer, or solution)
+      let fileType = 'document'
+      if (file.name.toLowerCase().includes('question')) {
+        fileType = 'question'
+      } else if (file.name.toLowerCase().includes('answer')) {
+        fileType = 'answer'
+      } else if (file.name.toLowerCase().includes('solution')) {
+        fileType = 'solution'
+      }
+      
+      const fileInfo = await uploadFileToStorage(file, userId, fileType)
+      fileData[fileType] = fileInfo
+    }
+
+    // Send file URLs to backend for grading
+    const response = await axios.post(`${API_BASE_URL}/grade`, {
+      userId: userId,
+      files: fileData
+    })
+
+    return response.data
+  } catch (error) {
+    console.error("Error sending files for grading:", error)
+    throw error
+  }
+}
+
+// Save grading results to Firestore
+const saveGradingResults = async (userId, files, gradingResults) => {
+  try {
+    const gradingRef = collection(db, "users", userId, "gradings")
+    const timestamp = serverTimestamp()
+    const gradingData = {
+      timestamp: timestamp,
+      files: files,
+      results: gradingResults,
+      status: "completed"
+    }
+
+    const docRef = await addDoc(gradingRef, gradingData)
+    
+    // Add gradings to classroom if it exists
+    if (gradingResults.classroomId) {
+      const submissionRef = collection(db, "classrooms", gradingResults.classroomId, "submissions")
+      await addDoc(submissionRef, {
+        ...gradingData,
+        studentId: gradingResults.studentId || null,
+        assignmentId: gradingResults.assignmentId || null,
+        gradedBy: userId
+      })
+    }
+    
+    return docRef.id
+  } catch (error) {
+    console.error("Error saving grading results:", error)
+    throw error
   }
 }
 
@@ -592,6 +737,11 @@ const TeacherDashboard = () => {
   const [isTyping, setIsTyping] = useState(false)
   const [typingText, setTypingText] = useState("")
   const [classes, setClasses] = useState([])
+  const [isGrading, setIsGrading] = useState(false);
+  const [gradingError, setGradingError] = useState(null);
+  const [gradingResult, setGradingResult] = useState(null);
+  const [aiLoading, setAiLoading] = useState(false);
+  const [selectedAssignment, setSelectedAssignment] = useState(null);
   const [recentGrades, setRecentGrades] = useState([])
   const [selectedClass, setSelectedClass] = useState(null)
   const [viewMode, setViewMode] = useState("overview")
@@ -617,6 +767,46 @@ const TeacherDashboard = () => {
   const [filterAnchorEl, setFilterAnchorEl] = useState(null)
   const [selectedFilter, setSelectedFilter] = useState("all")
   const [searchQuery, setSearchQuery] = useState("")
+  // Light/Dark theme configuration
+  const lightTheme = createTheme({
+    palette: {
+      mode: 'light',
+      primary: {
+        main: '#1976d2',
+        light: '#42a5f5',
+        dark: '#1565c0',
+      },
+      secondary: {
+        main: '#9c27b0',
+        light: '#ba68c8',
+        dark: '#7b1fa2',
+      },
+    },
+  })
+
+  const darkTheme = createTheme({
+    palette: {
+      mode: 'dark',
+      primary: {
+        main: '#90caf9',
+        light: '#e3f2fd',
+        dark: '#42a5f5',
+      },
+      secondary: {
+        main: '#ce93d8',
+        light: '#f3e5f5',
+        dark: '#ab47bc',
+      },
+      background: {
+        default: '#121212',
+        paper: '#1e1e1e',
+      },
+    },
+  })
+  
+  // Select active theme based on darkMode state
+  const activeTheme = darkMode ? darkTheme : lightTheme
+
   const [showSearch, setShowSearch] = useState(false)
   const [suggestions, setSuggestions] = useState([
     "How can I create a quiz for my biology class?",
@@ -884,6 +1074,7 @@ const TeacherDashboard = () => {
       setIsOffline(false)
       showSnackbar("You're back online!", "success")
     }
+
     const handleOffline = () => {
       setIsOffline(true)
       showSnackbar("You're offline. Some features may be limited.", "warning")
@@ -1204,73 +1395,246 @@ const TeacherDashboard = () => {
     setInputError("")
     return true
   }
-
-  const handleChatSubmit = (e) => {
-    e.preventDefault()
-
-    if (!validateChatInput()) {
-      return
-    }
-
-    // Stop speech recognition if it's active
-    if (isListening && recognitionRef.current) {
-      recognitionRef.current.stop()
-      setIsListening(false)
-      setInterimTranscript("")
-    }
-
-    // Add user message
-    const userMessage = {
-      id: Date.now(),
-      content: chatInput,
-      role: "user",
-      files: uploadedFiles,
-    }
-    setMessages((prev) => [...prev, userMessage])
-    setChatInput("")
-    setUploadedFiles([])
-    setShowSuggestions(false)
-
-    // Simulate AI response with proper loading state
-    setIsTyping(true)
-
-    // Generate AI response text
-    const responseText = getAIResponse(chatInput, uploadedFiles)
-    setTypingText(responseText)
-
-    // Use a more realistic delay based on message length and files
-    const responseDelay = Math.min(1000 + chatInput.length / 10 + uploadedFiles.length * 500, 3000)
-
-    setTimeout(() => {
-      try {
-        const aiResponse = {
-          id: Date.now() + 1,
-          content: responseText,
-          role: "assistant",
-        }
-        setMessages((prev) => [...prev, aiResponse])
-        saveChatHistory(userMessage, aiResponse)
-        showSnackbar("Response received", "success")
-      } catch (error) {
-        console.error("Error generating AI response:", error)
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: Date.now() + 1,
-            content: "I'm sorry, I encountered an error processing your request. Please try again.",
-            role: "assistant",
-            isError: true,
-          },
-        ])
-        showSnackbar("Error generating response", "error")
-      } finally {
-        setIsTyping(false)
-        setTypingText("")
+  const extractTextFromPDF = async (file) => {
+    try {
+      const arrayBuffer = await file.arrayBuffer();
+      const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+      
+      let fullText = '';
+      for (let i = 1; i <= pdf.numPages; i++) {
+        const page = await pdf.getPage(i);
+        const textContent = await page.getTextContent();
+        const pageText = textContent.items.map(item => item.str).join(' ');
+        fullText += `Page ${i}:\n${pageText}\n\n`;
       }
-    }, responseDelay)
+      
+      return fullText;
+    } catch (error) {
+      console.error("Error extracting PDF text:", error);
+      return "Failed to extract text from PDF";
+    }
+  };
+  // Process grading with AI
+  const processGrading = async () => {
+    try {
+      if (uploadedFiles.length === 0) {
+        setInputError("Please upload files for grading")
+        return
+      }
+      
+      setIsGrading(true)
+      setGradingError(null)
+      
+      // Add user message about grading
+      const userMessage = {
+        id: Date.now(),
+        content: "Please grade these documents",
+        role: "user",
+        files: uploadedFiles,
+      }
+      setMessages((prev) => [...prev, userMessage])
+      
+      // Simulate typing for better UX
+      setIsTyping(true)
+      setTypingText("Processing your documents for grading...")
+      
+      // Get user ID
+      const userId = auth.currentUser?.uid
+      if (!userId) {
+        throw new Error("User not authenticated")
+      }
+      
+      // Send files to backend and get grading results
+      const results = await sendFilesForGrading(uploadedFiles, userId)
+      
+      // Save results to Firebase
+      await saveGradingResults(userId, uploadedFiles, results)
+      
+      // Store results in state
+      setGradingResults(results)
+      
+      // Format response message
+      let responseContent = "## Grading Results\n\n"
+      
+      if (results.totalScore !== undefined) {
+        responseContent += `**Total Score:** ${results.totalScore}/${results.maxScore}\n\n`
+      }
+      
+      if (results.feedback && results.feedback.length > 0) {
+        responseContent += "### Question-by-Question Feedback:\n\n"
+        results.feedback.forEach((item, index) => {
+          responseContent += `**Question ${item.q}:** ${item.correct ? '✓' : '✗'} ${item.remarks}\n`
+          if (item.refPage) {
+            responseContent += `Reference: Page ${item.refPage}\n`
+          }
+          responseContent += '\n'
+        })
+      }
+      
+      responseContent += "Would you like me to provide more detailed feedback on any specific question?"
+      
+      // Add AI response with grading results
+      const aiResponse = {
+        id: Date.now() + 1,
+        content: responseContent,
+        role: "assistant",
+        gradingResults: results
+      }
+      setMessages((prev) => [...prev, aiResponse])
+      saveChatHistory(userMessage, aiResponse)
+      
+      // Clear uploaded files
+      setUploadedFiles([])
+      
+      showSnackbar("Grading completed successfully", "success")
+    } catch (error) {
+      console.error("Error processing grading:", error)
+      setGradingError(`Grading failed: ${error.message}`)
+      
+      // Add error message to chat
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: Date.now() + 1,
+          content: `I encountered an error while grading: ${error.message}. Please try again or check if all required documents are uploaded.`,
+          role: "assistant",
+          isError: true,
+        },
+      ])
+      
+      showSnackbar("Grading failed", "error")
+    } finally {
+      setIsTyping(false)
+      setTypingText("")
+      setIsGrading(false)
+    }
   }
 
+  // Handle grading request
+  const handleGradingRequest = () => {
+    processGrading()
+  }
+  
+  const handleChatSubmit = async (e) => {
+    e.preventDefault();
+    
+    if (!validateChatInput()) {
+      return;
+    }
+  
+    // Stop speech recognition if it's active
+    if (isListening && recognitionRef.current) {
+      recognitionRef.current.stop();
+      setIsListening(false);
+      setInterimTranscript("");
+    }
+  
+    // First, create the userMessage object BEFORE using it
+    const userMessage = {
+      id: Date.now(),
+      ...createMessageWithFiles(chatInput, uploadedFiles)
+    };
+  
+    setMessages((prev) => [...prev, userMessage]);
+    setChatInput("");
+    setUploadedFiles([]);
+    setShowSuggestions(false);
+  
+    // Show typing indicator
+    setIsTyping(true);
+    setTypingText(""); // Clear any previous typing text
+  
+    try {
+      // Determine if this is a grading request - either explicit in text or implied by file uploads
+      const isGradingRequest = uploadedFiles.length > 0 && (
+        chatInput.toLowerCase().includes("grade") || 
+        chatInput.toLowerCase().includes("check") || 
+        chatInput.toLowerCase().includes("assess") ||
+        chatInput.toLowerCase().includes("evaluate") ||
+        // If no specific instruction but files are uploaded, assume grading
+        chatInput.trim() === ""
+      );
+  
+      // Build message combining text input and file info
+      let enhancedMessage = chatInput;
+      
+      if (uploadedFiles.length > 0) {
+        // Create descriptive information about files
+        const fileDescriptions = uploadedFiles.map(file => {
+          const sizeInKB = (file.size / 1024).toFixed(2);
+          return `- ${file.name} (${file.type}, ${sizeInKB} KB)`;
+        });
+        
+        // Add file descriptions to the message
+        enhancedMessage += `\n\nI've attached the following files:\n${fileDescriptions.join('\n')}\n\n`;
+        
+        // For grading requests, add specific instructions
+        if (isGradingRequest) {
+          enhancedMessage = enhancedMessage.trim() === "" ? 
+            "Please grade these files for me. Provide a detailed analysis of each answer, assign scores, and give feedback." : 
+            enhancedMessage;
+          
+          enhancedMessage += "\n\nPlease grade these files automatically. Identify correct and incorrect answers, assign scores, and provide detailed feedback.";
+        } else if (uploadedFiles.some(file => file.type === 'application/pdf')) {
+          enhancedMessage += "Please help me analyze these PDF files based on my request.\n\n";
+        }
+      }
+  
+      // Make API call with the combined message from all input sources
+      const response = await axios.post(`${API_BASE_URL}/api/chat`, {
+        message: enhancedMessage,
+        userId: auth.currentUser?.uid,
+        files: uploadedFiles.length > 0 ? uploadedFiles.map(file => file.name) : [],
+        history: messages.slice(-6) // Send last 6 messages for context
+      });
+  
+      // Add AI response
+      const aiResponse = {
+        id: Date.now() + 1,
+        content: response.data.text,
+        role: "assistant",
+      };
+      setMessages((prev) => [...prev, aiResponse]);
+      
+      // Save to chat history
+      saveChatHistory(userMessage, aiResponse);
+      showSnackbar("Response received", "success");
+    } catch (error) {
+      console.error("Error calling Gemini API:", error);
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: Date.now() + 1,
+          content: "I'm sorry, I encountered an error processing your request. Please try again.",
+          role: "assistant",
+          isError: true,
+        },
+      ]);
+      showSnackbar("Error generating response", "error");
+    } finally {
+      setIsTyping(false);
+      setTypingText("");
+      if (typeof setAiLoading === 'function') {
+        setAiLoading(false);
+      }
+    }
+  };
+
+  // Enhanced getAIResponse function that recognizes grading requests
   const getAIResponse = (input, files) => {
+    // Check if this is a grading-related query
+    if (input.toLowerCase().includes("grade") || 
+        input.toLowerCase().includes("check") || 
+        input.toLowerCase().includes("review") || 
+        input.toLowerCase().includes("evaluate")) {
+      if (files.length > 0) {
+        return "I'll analyze these documents and provide a detailed grading report."
+      } else {
+        return "I can help you grade documents. Please upload question papers, answer sheets, or solution papers to begin."
+      }
+    }
+
+    // Handle files
     if (files.length > 0) {
       if (files.some((f) => f.name.toLowerCase().includes("question"))) {
         return "I've analyzed the question paper. It contains 5 multiple choice questions and 3 essay questions. Would you like me to suggest a grading rubric?"
@@ -1282,6 +1646,7 @@ const TeacherDashboard = () => {
       return "I've received your files and processed them. How would you like me to help with these documents?"
     }
 
+    // Regular queries
     if (input.toLowerCase().includes("grade") || input.toLowerCase().includes("assess")) {
       return "I can help you grade papers. Upload student submissions, and I'll analyze them based on your rubric or solution key."
     } else if (input.toLowerCase().includes("quiz") || input.toLowerCase().includes("test")) {
@@ -1357,7 +1722,6 @@ const TeacherDashboard = () => {
           file: file,
           size: formatFileSize(file.size),
         }))
-
         showSnackbar("File selected successfully", "success")
       }
     } catch (error) {
@@ -1414,9 +1778,7 @@ const TeacherDashboard = () => {
       case "graded":
         return <Chip icon={<CheckCircleIcon />} label="Graded" size="small" color="success" variant="outlined" />
       case "pending":
-        return (
-          <Chip icon={<PendingActionsIcon />} label="Pending Review" size="small" color="warning" variant="outlined" />
-        )
+        return <Chip icon={<PendingActionsIcon />} label="Pending Review" size="small" color="warning" variant="outlined" />
       case "not_submitted":
         return <Chip icon={<CancelIcon />} label="Not Submitted" size="small" color="error" variant="outlined" />
       default:
@@ -1426,20 +1788,50 @@ const TeacherDashboard = () => {
 
   const saveChatHistory = async (message, response) => {
     if (!auth.currentUser) return
-
+  
     try {
+      // Function to safely sanitize objects by removing File objects
+      const sanitizeForFirestore = (obj) => {
+        // Create a deep copy we can modify
+        const sanitized = { ...obj };
+        
+        // If the object has files property that contains File objects, replace with metadata
+        if (sanitized.files && Array.isArray(sanitized.files)) {
+          sanitized.files = sanitized.files.map(file => {
+            // If it's a File object
+            if (file instanceof File || (file && typeof file === 'object' && file.name && file.type)) {
+              return {
+                name: file.name,
+                type: file.type,
+                size: file.size || 0,
+                lastModified: file.lastModified || Date.now()
+              };
+            }
+            return file; // If it's already sanitized or is just a string path
+          });
+        }
+        
+        return sanitized;
+      };
+  
+      // Sanitize both message and response
+      const sanitizedMessage = sanitizeForFirestore(message);
+      const sanitizedResponse = sanitizeForFirestore(response);
+  
       const chatHistoryRef = collection(db, "teachers", auth.currentUser.uid, "chatHistory")
       const newChatEntry = {
-        title: message.content.substring(0, 50) + (message.content.length > 50 ? "..." : ""),
+        title: message.content.substring(0, 50) + (message.content.length > 50 ? "...": ""),
         time: new Date().toISOString(),
-        messages: [message, response],
+        messages: [sanitizedMessage, sanitizedResponse],
         createdAt: new Date(),
       }
-
+      
       await addDoc(chatHistoryRef, newChatEntry)
-
+  
       // Update local chat history
       setChatHistory((prev) => [newChatEntry, ...prev])
+      
+      console.log("Chat history saved successfully");
     } catch (error) {
       console.error("Error saving chat history:", error)
       showSnackbar("Failed to save chat history", "error")
@@ -1638,7 +2030,6 @@ const TeacherDashboard = () => {
       setResourceUploadProgress((prev) => {
         if (prev >= 100) {
           clearInterval(uploadInterval)
-
           // Add new resource to the list
           const newResource = {
             id: `r${resources.length + 1}`,
@@ -1654,7 +2045,6 @@ const TeacherDashboard = () => {
           }
 
           setResources((prev) => [newResource, ...prev])
-
           // Close dialog and show success message
           setTimeout(() => {
             setIsResourceUploading(false)
@@ -1679,7 +2069,6 @@ const TeacherDashboard = () => {
 
   const handleResourceShareToggle = (resourceId) => {
     setResources((prev) => prev.map((r) => (r.id === resourceId ? { ...r, shared: !r.shared } : r)))
-
     const resource = resources.find((r) => r.id === resourceId)
     showSnackbar(`Resource ${resource?.shared ? "unshared" : "shared"} successfully`, "success")
   }
@@ -1687,10 +2076,8 @@ const TeacherDashboard = () => {
   const handleResourceDownload = (resource) => {
     // Simulate download
     showSnackbar(`Downloading ${resource.title}...`, "info")
-
     // Update download count
     setResources((prev) => prev.map((r) => (r.id === resource.id ? { ...r, downloads: r.downloads + 1 } : r)))
-
     setTimeout(() => {
       showSnackbar(`${resource.title} downloaded successfully`, "success")
     }, 1500)
@@ -1758,7 +2145,7 @@ const TeacherDashboard = () => {
                 >
                   {message.content.substring(0, 50)}...
                 </Typography>
-                <IconButton size="small" onClick={() => handleUnpinMessage(message.id)}>
+                <IconButton size="small" onClick={() => handleUnpinMessage(message.id)} sx={{ p: 0.5 }}>
                   <CloseIcon fontSize="small" />
                 </IconButton>
               </Box>
@@ -1855,25 +2242,43 @@ const TeacherDashboard = () => {
           </Fade>
         )}
 
-        {/* Uploaded Files Display */}
+        {/* Uploaded Files Display with Grading Button */}
         {uploadedFiles.length > 0 && (
-          <Box sx={{ display: "flex", flexWrap: "wrap", mb: 1 }}>
-            {uploadedFiles.map((file, index) => (
-              <Zoom in={true} key={index} style={{ transitionDelay: `${index * 50}ms` }}>
-                <FileChip sx={{ display: "flex", alignItems: "center" }}>
-                  {getFileIcon(file.name)}
-                  <Typography variant="caption" sx={{ ml: 0.5, mr: 0.5 }}>
-                    {file.name}
-                  </Typography>
-                  <Typography variant="caption" color="text.secondary">
-                    ({getFileType(file.name)})
-                  </Typography>
-                  <IconButton size="small" onClick={() => removeFile(index)} sx={{ ml: 0.5, p: 0.5 }}>
-                    <CloseIcon fontSize="small" />
-                  </IconButton>
-                </FileChip>
-              </Zoom>
-            ))}
+          <Box sx={{ mb: 2 }}>
+            <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "center", mb: 1 }}>
+              <Typography variant="subtitle2">Uploaded Files</Typography>
+              <GradientButton
+                size="small"
+                startIcon={<AssessmentIcon />}
+                onClick={handleGradingRequest}
+                disabled={isGrading}
+              >
+                {isGrading ? "Grading..." : "Grade Documents"}
+              </GradientButton>
+            </Box>
+            <Box sx={{ display: "flex", flexWrap: "wrap" }}>
+              {uploadedFiles.map((file, index) => (
+                <Zoom in={true} key={index} style={{ transitionDelay: `${index * 50}ms` }}>
+                  <FileChip sx={{ display: "flex", alignItems: "center" }}>
+                    {getFileIcon(file.name)}
+                    <Typography variant="caption" sx={{ ml: 0.5, mr: 0.5 }}>
+                      {file.name}
+                    </Typography>
+                    <Typography variant="caption" color="text.secondary">
+                      ({getFileType(file.name)})
+                    </Typography>
+                    <IconButton size="small" onClick={() => removeFile(index)} sx={{ ml: 0.5, p: 0.5 }}>
+                      <CloseIcon fontSize="small" />
+                    </IconButton>
+                  </FileChip>
+                </Zoom>
+              ))}
+            </Box>
+            {gradingError && (
+              <Typography variant="caption" color="error" sx={{ mt: 1, display: "block" }}>
+                {gradingError}
+              </Typography>
+            )}
           </Box>
         )}
 
@@ -2313,9 +2718,7 @@ const TeacherDashboard = () => {
                               sx={{
                                 fontWeight: "bold",
                                 transition: "all 0.2s ease",
-                                "&:hover": {
-                                  transform: "scale(1.05)",
-                                },
+                                "&:hover": { transform: "scale(1.05)" },
                               }}
                             />
                           </TableCell>
@@ -2555,7 +2958,6 @@ const TeacherDashboard = () => {
                 ))}
               </Select>
             </FormControl>
-
             <FormControl size="small" sx={{ minWidth: 120 }}>
               <InputLabel id="resource-subject-filter-label">Subject</InputLabel>
               <Select
@@ -2744,10 +3146,10 @@ const TeacherDashboard = () => {
                             resource.type === "document"
                               ? "primary"
                               : resource.type === "presentation"
-                                ? "secondary"
-                                : resource.type === "video"
-                                  ? "success"
-                                  : "default"
+                              ? "secondary"
+                              : resource.type === "video"
+                              ? "success"
+                              : "default"
                           }
                           variant="outlined"
                         />
@@ -2998,7 +3400,7 @@ const TeacherDashboard = () => {
             startIcon={isResourceUploading ? <CircularProgress size={16} /> : <CloudUploadIcon />}
           >
             {isResourceUploading ? "Uploading..." : "Upload Resource"}
-          </GradientButton>
+            </GradientButton>
         </DialogActions>
       </Dialog>
 
@@ -3267,11 +3669,9 @@ const TeacherDashboard = () => {
           <Typography variant="h6" gutterBottom>
             Please update your Firestore security rules:
           </Typography>
-
           <ol>
             <li>
-              <Typography paragraph>
-                Go to{" "}
+              <Typography paragraph>Go to{" "}
                 <Link
                   href="https://console.firebase.google.com/project/solutionchallenge-e876c/firestore/rules"
                   target="_blank"
@@ -3305,8 +3705,7 @@ const TeacherDashboard = () => {
               <Typography paragraph>Click "Publish"</Typography>
             </li>
             <li>
-              <Typography paragraph>
-                Then go to{" "}
+              <Typography paragraph>Then go to{" "}
                 <Link
                   href="https://console.firebase.google.com/project/solutionchallenge-e876c/storage/rules"
                   target="_blank"
@@ -3361,14 +3760,14 @@ const TeacherDashboard = () => {
               color: "primary.main",
             }}
           >
-            G
+            GradeGood
           </Typography>
         </Box>
         <Typography variant="h6" color="primary" fontWeight="bold" sx={{ mb: 1 }}>
-          GradeGood
+          Loading teacher dashboard...
         </Typography>
         <Typography variant="body1" color="text.secondary">
-          Loading teacher dashboard...
+          Please wait while we fetch your data.
         </Typography>
         <Box sx={{ width: "200px", mt: 3 }}>
           <LinearProgress color="primary" />
@@ -3378,393 +3777,383 @@ const TeacherDashboard = () => {
   }
 
   return (
-    <Box sx={{ display: "flex" }}>
-      {/* App Bar */}
-      <AppBar
-        position="fixed"
-        sx={{
-          zIndex: (theme) => theme.zIndex.drawer + 1,
-          background: `linear-gradient(90deg, ${theme.palette.primary.main} 0%, ${theme.palette.primary.dark} 100%)`,
-          boxShadow: "0 4px 20px rgba(0, 0, 0, 0.1)",
-        }}
-      >
-        <Toolbar>
-          <IconButton
-            color="inherit"
-            aria-label="open sidebar"
-            edge="start"
-            onClick={() => setSidebarOpen(true)}
-            sx={{
-              mr: 2,
-              transition: "transform 0.2s ease",
-              "&:hover": {
-                transform: "rotate(180deg)",
-              },
-            }}
-          >
-            <MenuIcon />
-          </IconButton>
-          <Typography
-            variant="h6"
-            noWrap
-            component="div"
-            sx={{
-              flexGrow: 1,
-              fontWeight: "bold",
-              background: "linear-gradient(45deg, #fff, #f0f0f0)",
-              WebkitBackgroundClip: "text",
-              WebkitTextFillColor: "transparent",
-            }}
-          >
-            GradeGood
-          </Typography>
-
-          {showSearch && (
-            <Fade in={showSearch}>
-              <TextField
-                id="search-input"
-                placeholder="Search..."
-                variant="outlined"
-                size="small"
-                value={searchQuery}
-                onChange={handleSearchChange}
-                sx={{
-                  mr: 2,
-                  width: 200,
-                  bgcolor: "rgba(255, 255, 255, 0.15)",
-                  borderRadius: 1,
-                  "& .MuiOutlinedInput-root": {
-                    color: "white",
-                    "& fieldset": {
-                      borderColor: "rgba(255, 255, 255, 0.3)",
-                    },
-                    "&:hover fieldset": {
-                      borderColor: "rgba(255, 255, 255, 0.5)",
-                    },
-                    "&.Mui-focused fieldset": {
-                      borderColor: "white",
-                    },
-                  },
-                  "& .MuiInputBase-input::placeholder": {
-                    color: "rgba(255, 255, 255, 0.7)",
-                    opacity: 1,
-                  },
-                }}
-                InputProps={{
-                  endAdornment: (
-                    <IconButton size="small" onClick={toggleSearch} sx={{ color: "white" }}>
-                      <CloseIcon fontSize="small" />
-                    </IconButton>
-                  ),
-                }}
-              />
-            </Fade>
-          )}
-
-          <Tooltip title="Search">
-            <IconButton color="inherit" onClick={toggleSearch} sx={{ display: showSearch ? "none" : "flex" }}>
-              <SearchIcon />
-            </IconButton>
-          </Tooltip>
-
-          <Tooltip title="Notifications">
-            <IconButton color="inherit" aria-label="notifications">
-              <Badge badgeContent={3} color="error">
-                <NotificationsIcon />
-              </Badge>
-            </IconButton>
-          </Tooltip>
-
-          <Box sx={{ display: "flex", alignItems: "center", ml: 2 }}>
-            <AnimatedAvatar
+    <ThemeProvider theme={activeTheme}>
+      <Box sx={{ display: "flex" }}>
+        {/* App Bar */}
+        <AppBar
+          position="fixed"
+          sx={{
+            zIndex: (theme) => theme.zIndex.drawer + 1,
+            background: `linear-gradient(90deg, ${theme.palette.primary.main} 0%, ${theme.palette.primary.dark} 100%)`,
+            boxShadow: "0 4px 20px rgba(0, 0, 0, 0.1)",
+          }}
+        >
+          <Toolbar>
+            <IconButton
+              color="inherit"
+              aria-label="open sidebar"
+              edge="start"
+              onClick={() => setSidebarOpen(true)}
               sx={{
-                bgcolor: "secondary.main",
-                width: 32,
-                height: 32,
-                cursor: "pointer",
+                mr: 2,
+                transition: "transform 0.2s ease",
+                "&:hover": {
+                  transform: "rotate(180deg)",
+                },
               }}
-              onClick={handleMenuOpen}
             >
-              {userData?.name?.charAt(0) || "T"}
-            </AnimatedAvatar>
-            <Typography variant="body1" sx={{ ml: 1, display: { xs: "none", sm: "block" } }}>
-              {userData?.name}
-            </Typography>
-            <IconButton color="inherit" onClick={handleMenuOpen} size="small" sx={{ ml: 0.5 }}>
-              <ExpandMoreIcon />
+              <MenuIcon />
             </IconButton>
-            <Menu
-              anchorEl={anchorEl}
-              open={Boolean(anchorEl)}
-              onClose={handleMenuClose}
-              transformOrigin={{ horizontal: "right", vertical: "top" }}
-              anchorOrigin={{ horizontal: "right", vertical: "bottom" }}
+            <Typography
+              variant="h6"
+              noWrap
+              component="div"
+              sx={{
+                flexGrow: 1,
+                fontWeight: "bold",
+                background: "linear-gradient(45deg, #fff, #f0f0f0)",
+                WebkitBackgroundClip: "text",
+                WebkitTextFillColor: "transparent",
+              }}
             >
-              <MenuItem
-                onClick={() => {
-                  handleMenuClose()
-                  handleViewChange("settings")
+              GradeGood
+            </Typography>
+            {showSearch && (
+              <Fade in={showSearch}>
+                <TextField
+                  id="search-input"
+                  placeholder="Search..."
+                  variant="outlined"
+                  size="small"
+                  value={searchQuery}
+                  onChange={handleSearchChange}
+                  sx={{
+                    mr: 2,
+                    width: 200,
+                    bgcolor: "rgba(255, 255, 255, 0.15)",
+                    borderRadius: 1,
+                    "& .MuiOutlinedInput-root": {
+                      color: "white",
+                      "& fieldset": {
+                        borderColor: "rgba(255, 255, 255, 0.3)",
+                      },
+                      "&:hover fieldset": {
+                        borderColor: "rgba(255, 255, 255, 0.5)",
+                      },
+                      "&.Mui-focused fieldset": {
+                        borderColor: "white",
+                      },
+                    },
+                    "& .MuiInputBase-input::placeholder": {
+                      color: "rgba(255, 255, 255, 0.7)",
+                      opacity: 1,
+                    },
+                  }}
+                  InputProps={{
+                    endAdornment: (
+                      <IconButton size="small" onClick={toggleSearch} sx={{ color: "white" }}>
+                        <CloseIcon fontSize="small" />
+                      </IconButton>
+                    ),
+                  }}
+                />
+              </Fade>
+            )}
+
+            <Tooltip title="Search">
+              <IconButton color="inherit" onClick={toggleSearch} sx={{ display: showSearch ? "none" : "flex" }}>
+                <SearchIcon />
+              </IconButton>
+            </Tooltip>
+
+            <Tooltip title="Notifications">
+              <IconButton color="inherit" aria-label="notifications">
+                <Badge badgeContent={3} color="error">
+                  <NotificationsIcon />
+                </Badge>
+              </IconButton>
+            </Tooltip>
+
+            <Box sx={{ display: "flex", alignItems: "center", ml: 2 }}>
+              <AnimatedAvatar
+                sx={{
+                  bgcolor: "secondary.main",
+                  width: 32,
+                  height: 32,
+                  cursor: "pointer",
+                }}
+                onClick={handleMenuOpen}
+              >
+                {userData?.name?.charAt(0) || "T"}
+              </AnimatedAvatar>
+              <Typography variant="body1" sx={{ ml: 1, display: { xs: "none", sm: "block" } }}>
+                {userData?.name}
+              </Typography>
+              <IconButton color="inherit" onClick={handleMenuOpen} size="small" sx={{ ml: 0.5 }}>
+                <ExpandMoreIcon />
+              </IconButton>
+              <Menu
+                anchorEl={anchorEl}
+                open={Boolean(anchorEl)}
+                onClose={handleMenuClose}
+                transformOrigin={{ horizontal: "right", vertical: "top" }}
+                anchorOrigin={{ horizontal: "right", vertical: "bottom" }}
+              >
+                <MenuItem
+                  onClick={() => {
+                    handleMenuClose()
+                    handleViewChange("settings")
+                  }}
+                >
+                  <ListItemIcon>
+                    <SettingsIcon fontSize="small" />
+                  </ListItemIcon>
+                  Settings
+                </MenuItem>
+                <MenuItem onClick={toggleDarkMode}>
+                  <ListItemIcon>
+                    {darkMode ? <LightModeIcon fontSize="small" /> : <DarkModeIcon fontSize="small" />}
+                  </ListItemIcon>
+                  {darkMode ? "Light Mode" : "Dark Mode"}
+                </MenuItem>
+                <Divider />
+                <MenuItem onClick={handleLogoutClick}>
+                  <ListItemIcon>
+                    <LogoutIcon fontSize="small" />
+                  </ListItemIcon>
+                  Logout
+                </MenuItem>
+              </Menu>
+            </Box>
+          </Toolbar>
+        </AppBar>
+
+        {/* Sidebar */}
+        <Drawer
+          anchor="left"
+          open={sidebarOpen}
+          onClose={() => setSidebarOpen(false)}
+          sx={{
+            width: drawerWidth,
+            flexShrink: 0,
+            "& .MuiDrawer-paper": {
+              width: drawerWidth,
+              boxSizing: "border-box",
+              boxShadow: "4px 0 10px rgba(0, 0, 0, 0.1)",
+            },
+          }}
+        >
+          <Box
+            sx={{
+              p: 2,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              background: `linear-gradient(45deg, ${theme.palette.primary.main} 30%, ${theme.palette.primary.light} 90%)`,
+              color: "white",
+            }}
+          >
+            <Typography variant="h6" sx={{ fontWeight: 700 }}>
+              GradeGood
+            </Typography>
+            <IconButton onClick={() => setSidebarOpen(false)} sx={{ color: "white" }}>
+              <CloseIcon />
+            </IconButton>
+          </Box>
+          <Divider />
+          <List>
+            <ListItem disablePadding>
+              <ListItemButton
+                selected={activeView === "ai-assistant"}
+                onClick={() => handleViewChange("ai-assistant")}
+                sx={{
+                  transition: "all 0.2s ease",
+                  "&.Mui-selected": {
+                    borderRight: `3px solid ${theme.palette.primary.main}`,
+                    bgcolor: alpha(theme.palette.primary.main, 0.1),
+                  },
+                  "&:hover": {
+                    bgcolor: alpha(theme.palette.primary.main, 0.05),
+                  },
                 }}
               >
                 <ListItemIcon>
-                  <SettingsIcon fontSize="small" />
+                  <ChatIcon color={activeView === "ai-assistant" ? "primary" : "inherit"} />
                 </ListItemIcon>
-                Settings
-              </MenuItem>
-              <MenuItem onClick={toggleDarkMode}>
+                <ListItemText primary="AI Assistant" />
+              </ListItemButton>
+            </ListItem>
+            <ListItem disablePadding>
+              <ListItemButton
+                selected={activeView === "classroom"}
+                onClick={() => handleViewChange("classroom")}
+                sx={{
+                  transition: "all 0.2s ease",
+                  "&.Mui-selected": {
+                    borderRight: `3px solid ${theme.palette.primary.main}`,
+                    bgcolor: alpha(theme.palette.primary.main, 0.1),
+                  },
+                  "&:hover": {
+                    bgcolor: alpha(theme.palette.primary.main, 0.05),
+                  },
+                }}
+              >
                 <ListItemIcon>
-                  {darkMode ? <VisibilityIcon fontSize="small" /> : <VisibilityOffIcon fontSize="small" />}
+                  <SchoolIcon color={activeView === "classroom" ? "primary" : "inherit"} />
                 </ListItemIcon>
-                {darkMode ? "Light Mode" : "Dark Mode"}
-              </MenuItem>
-              <Divider />
-              <MenuItem onClick={handleLogoutClick}>
+                <ListItemText primary="Classroom" />
+              </ListItemButton>
+            </ListItem>
+            <ListItem disablePadding>
+              <ListItemButton
+                selected={activeView === "resource-management"}
+                onClick={() => handleViewChange("resource-management")}
+                sx={{
+                  transition: "all 0.2s ease",
+                  "&.Mui-selected": {
+                    borderRight: `3px solid ${theme.palette.primary.main}`,
+                    bgcolor: alpha(theme.palette.primary.main, 0.1),
+                  },
+                  "&:hover": {
+                    bgcolor: alpha(theme.palette.primary.main, 0.05),
+                  },
+                }}
+              >
                 <ListItemIcon>
-                  <LogoutIcon fontSize="small" />
+                  <LibraryBooksIcon color={activeView === "resource-management" ? "primary" : "inherit"} />
                 </ListItemIcon>
-                Logout
-              </MenuItem>
-            </Menu>
-          </Box>
-        </Toolbar>
-      </AppBar>
+                <ListItemText primary="Resources" />
+              </ListItemButton>
+            </ListItem>
+            <ListItem disablePadding>
+              <ListItemButton
+                selected={activeView === "settings"}
+                onClick={() => handleViewChange("settings")}
+                sx={{
+                  transition: "all 0.2s ease",
+                  "&.Mui-selected": {
+                    borderRight: `3px solid ${theme.palette.primary.main}`,
+                    bgcolor: alpha(theme.palette.primary.main, 0.1),
+                  },
+                  "&:hover": {
+                    bgcolor: alpha(theme.palette.primary.main, 0.05),
+                  },
+                }}
+              >
+                <ListItemIcon>
+                  <SettingsIcon color={activeView === "settings" ? "primary" : "inherit"} />
+                </ListItemIcon>
+                <ListItemText primary="Settings" />
+              </ListItemButton>
+            </ListItem>
+            <Divider sx={{ my: 1 }} />
+            <ListItem disablePadding>
+              <ListItemButton
+                onClick={handleChatHistoryToggle}
+                sx={{
+                  transition: "all 0.2s ease",
+                  "&:hover": {
+                    bgcolor: alpha(theme.palette.primary.main, 0.05),
+                  },
+                }}
+              >
+                <ListItemIcon>
+                  <HistoryIcon />
+                </ListItemIcon>
+                <ListItemText primary="Chat History" />
+                {chatHistoryOpen ? <ExpandLessIcon /> : <ExpandMoreIcon />}
+              </ListItemButton>
+            </ListItem>
+            <Collapse in={chatHistoryOpen} timeout="auto" unmountOnExit>
+              <List component="div" disablePadding>
+                {chatHistory.length > 0 ? (
 
-      {/* Sidebar */}
-      <Drawer
-        anchor="left"
-        open={sidebarOpen}
-        onClose={() => setSidebarOpen(false)}
-        sx={{
-          width: drawerWidth,
-          flexShrink: 0,
-          "& .MuiDrawer-paper": {
-            width: drawerWidth,
-            boxSizing: "border-box",
-            boxShadow: "4px 0 10px rgba(0, 0, 0, 0.1)",
-          },
-        }}
-      >
-        <Box
-          sx={{
-            p: 2,
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            background: `linear-gradient(45deg, ${theme.palette.primary.main} 30%, ${theme.palette.primary.light} 90%)`,
-            color: "white",
-          }}
-        >
-          <Typography variant="h6" sx={{ fontWeight: 700 }}>
-            GradeGood
-          </Typography>
-          <IconButton onClick={() => setSidebarOpen(false)} sx={{ color: "white" }}>
-            <CloseIcon />
-          </IconButton>
-        </Box>
-        <Divider />
-        <List>
-          <ListItem disablePadding>
-            <ListItemButton
-              onClick={() => handleViewChange("ai-assistant")}
-              selected={activeView === "ai-assistant"}
-              sx={{
-                transition: "all 0.2s ease",
-                "&.Mui-selected": {
-                  bgcolor: alpha(theme.palette.primary.main, 0.1),
-                  borderRight: `3px solid ${theme.palette.primary.main}`,
-                  "&:hover": {
-                    bgcolor: alpha(theme.palette.primary.main, 0.15),
-                  },
-                },
-                "&:hover": {
-                  bgcolor: alpha(theme.palette.primary.main, 0.05),
-                },
-              }}
-            >
-              <ListItemIcon>
-                <ChatIcon color={activeView === "ai-assistant" ? "primary" : "inherit"} />
-              </ListItemIcon>
-              <ListItemText primary="AI Assistant" />
-            </ListItemButton>
-          </ListItem>
-          <ListItem disablePadding>
-            <ListItemButton
-              onClick={() => handleViewChange("classroom")}
-              selected={activeView === "classroom"}
-              sx={{
-                transition: "all 0.2s ease",
-                "&.Mui-selected": {
-                  bgcolor: alpha(theme.palette.primary.main, 0.1),
-                  borderRight: `3px solid ${theme.palette.primary.main}`,
-                  "&:hover": {
-                    bgcolor: alpha(theme.palette.primary.main, 0.15),
-                  },
-                },
-                "&:hover": {
-                  bgcolor: alpha(theme.palette.primary.main, 0.05),
-                },
-              }}
-            >
-              <ListItemIcon>
-                <SchoolIcon color={activeView === "classroom" ? "primary" : "inherit"} />
-              </ListItemIcon>
-              <ListItemText primary="Classroom" />
-            </ListItemButton>
-          </ListItem>
-          <ListItem disablePadding>
-            <ListItemButton
-              onClick={() => handleViewChange("resource-management")}
-              selected={activeView === "resource-management"}
-              sx={{
-                transition: "all 0.2s ease",
-                "&.Mui-selected": {
-                  bgcolor: alpha(theme.palette.primary.main, 0.1),
-                  borderRight: `3px solid ${theme.palette.primary.main}`,
-                  "&:hover": {
-                    bgcolor: alpha(theme.palette.primary.main, 0.15),
-                  },
-                },
-                "&:hover": {
-                  bgcolor: alpha(theme.palette.primary.main, 0.05),
-                },
-              }}
-            >
-              <ListItemIcon>
-                <LibraryBooksIcon color={activeView === "resource-management" ? "primary" : "inherit"} />
-              </ListItemIcon>
-              <ListItemText primary="Resources" />
-            </ListItemButton>
-          </ListItem>
-          <ListItem disablePadding>
-            <ListItemButton
-              onClick={() => handleViewChange("settings")}
-              selected={activeView === "settings"}
-              sx={{
-                transition: "all 0.2s ease",
-                "&.Mui-selected": {
-                  bgcolor: alpha(theme.palette.primary.main, 0.1),
-                  borderRight: `3px solid ${theme.palette.primary.main}`,
-                  "&:hover": {
-                    bgcolor: alpha(theme.palette.primary.main, 0.15),
-                  },
-                },
-                "&:hover": {
-                  bgcolor: alpha(theme.palette.primary.main, 0.05),
-                },
-              }}
-            >
-              <ListItemIcon>
-                <SettingsIcon color={activeView === "settings" ? "primary" : "inherit"} />
-              </ListItemIcon>
-              <ListItemText primary="Settings" />
-            </ListItemButton>
-          </ListItem>
-          <ListItem disablePadding>
-            <ListItemButton
-              onClick={handleChatHistoryToggle}
-              sx={{
-                transition: "all 0.2s ease",
-                "&:hover": {
-                  bgcolor: alpha(theme.palette.primary.main, 0.05),
-                },
-              }}
-            >
-              <ListItemIcon>
-                <HistoryIcon />
-              </ListItemIcon>
-              <ListItemText primary="Chat History" />
-              {chatHistoryOpen ? <ExpandLessIcon /> : <ExpandMoreIcon />}
-            </ListItemButton>
-          </ListItem>
-          <Collapse in={chatHistoryOpen} timeout="auto" unmountOnExit>
-            <List component="div" disablePadding>
-              {chatHistory.length > 0 ? (
-                chatHistory.map((chat, index) => (
-                  <ListItem
-                    key={index}
-                    sx={{
-                      pl: 4,
-                      transition: "all 0.2s ease",
-                      "&:hover": {
-                        bgcolor: alpha(theme.palette.primary.main, 0.05),
-                      },
-                    }}
-                  >
-                    <ListItemText
-                      primary={chat.title}
-                      secondary={new Date(chat.time).toLocaleString()}
-                      primaryTypographyProps={{
-                        noWrap: true,
-                        style: { maxWidth: "180px" },
+                  chatHistory.map((chat, index) => (
+                    <ListItem
+                      key={index}
+                      sx={{
+                        pl: 4,
+                        transition: "all 0.2s ease",
+                        "&:hover": { bgcolor: alpha(theme.palette.primary.main, 0.05) },
                       }}
+                    >
+                      <ListItemText
+                        primary={chat.title}
+                        secondary={new Date(chat.time).toLocaleString()}
+                        primaryTypographyProps={{ color: "text.secondary", fontSize: "0.875rem" }}
+                        secondaryTypographyProps={{ color: "text.secondary", fontSize: "0.75rem" }}
+                        style={{ maxWidth: "180px" }}
+                        noWrap
+                      />
+                    </ListItem>
+                  ))
+                ) : (
+                  <ListItem sx={{ pl: 4 }}>
+                    <ListItemText
+                      primary="No chat history"
+                      primaryTypographyProps={{ color: "text.secondary", fontSize: "0.875rem" }}
                     />
                   </ListItem>
-                ))
-              ) : (
-                <ListItem sx={{ pl: 4 }}>
-                  <ListItemText
-                    primary="No chat history"
-                    primaryTypographyProps={{ color: "text.secondary", fontSize: "0.875rem" }}
-                  />
-                </ListItem>
-              )}
-            </List>
-          </Collapse>
-          <Divider sx={{ my: 1 }} />
-          <ListItem disablePadding>
-            <ListItemButton
-              onClick={handleLogoutClick}
-              sx={{
-                transition: "all 0.2s ease",
-                "&:hover": {
-                  bgcolor: alpha(theme.palette.error.main, 0.05),
-                  color: theme.palette.error.main,
+                )}
+              </List>
+            </Collapse>
+            <Divider sx={{ my: 1 }} />
+            <ListItem disablePadding>
+              <ListItemButton
+                onClick={handleLogoutClick}
+                sx={{
+                  transition: "all 0.2s ease",
+                  "&:hover": {
+                    bgcolor: alpha(theme.palette.error.main, 0.05),
+                  },
                   "& .MuiListItemIcon-root": {
                     color: theme.palette.error.main,
                   },
-                },
-              }}
-            >
-              <ListItemIcon>
-                <LogoutIcon />
-              </ListItemIcon>
-              <ListItemText primary="Logout" />
-            </ListItemButton>
-          </ListItem>
-        </List>
-      </Drawer>
+                }}
+              >
+                <ListItemIcon>
+                  <LogoutIcon />
+                </ListItemIcon>
+                <ListItemText primary="Logout" />
+              </ListItemButton>
+            </ListItem>
+          </List>
+        </Drawer>
 
-      {/* Main Content */}
-      <Main>
-        {isOffline && (
-          <Fade in={isOffline}>
-            <Alert
-              severity="warning"
-              sx={{
-                mb: 3,
-                animation: `${pulse} 2s infinite`,
-              }}
-              action={
+        {/* Main Content */}
+        <Main>
+          {isOffline && (
+            <Fade in={isOffline}>
+              <Alert severity="warning" sx={{ mb: 3 }}>
+                You are currently offline. Some features may be limited until you reconnect.
                 <Button color="inherit" size="small">
                   Retry
                 </Button>
-              }
-            >
-              You are currently offline. Some features may be limited until you reconnect.
-            </Alert>
-          </Fade>
-        )}
+              </Alert>
+            </Fade>
+          )}
+          {error && (
+            <Fade in={Boolean(error)}>
+              <Alert severity="error" sx={{ mb: 3 }} onClose={() => setError(null)}>
+                {error}
+              </Alert>
+            </Fade>
+          )}
+          {renderContent()}
+        </Main>
 
-        {error && (
-          <Fade in={Boolean(error)}>
-            <Alert severity="error" sx={{ mb: 3 }} onClose={() => setError(null)}>
-              {error}
-            </Alert>
-          </Fade>
-        )}
-
-        {renderContent()}
-
+        {/* Snackbar for notifications */}
+        <Snackbar
+          open={snackbar.open}
+          autoHideDuration={4000}
+          onClose={handleCloseSnackbar}
+          anchorOrigin={{ vertical: "bottom", horizontal: "right" }}
+        >
+          <Alert onClose={handleCloseSnackbar} severity={snackbar.severity} sx={{ width: "100%" }} variant="filled">
+            {snackbar.message}
+          </Alert>
+        </Snackbar>
+        
         {/* Logout Confirmation Dialog */}
         <Dialog
           open={showLogoutConfirm}
@@ -3789,22 +4178,9 @@ const TeacherDashboard = () => {
             </Button>
           </DialogActions>
         </Dialog>
+      </Box>
+    </ThemeProvider>
+  );
+};
 
-        {/* Snackbar for notifications */}
-        <Snackbar
-          open={snackbar.open}
-          autoHideDuration={4000}
-          onClose={handleCloseSnackbar}
-          anchorOrigin={{ vertical: "bottom", horizontal: "right" }}
-        >
-          <Alert onClose={handleCloseSnackbar} severity={snackbar.severity} sx={{ width: "100%" }} variant="filled">
-            {snackbar.message}
-          </Alert>
-        </Snackbar>
-      </Main>
-    </Box>
-  )
-}
-
-export default TeacherDashboard
-
+export default TeacherDashboard;
